@@ -8,16 +8,48 @@
 
 Proc root_proc;
 
+#define PID_LIMIT 32768
+static u64 pid_bitmap[PID_LIMIT / 64];
+static SpinLock pid_lock;
+// Nested lock order: process tree -> semaphore -> scheduler.
+static SpinLock tree_lock;
+
 void kernel_entry();
-void proc_entry();
+u64 proc_entry(void (*entry)(u64), u64 arg);
+
+static int alloc_pid()
+{
+    acquire_spinlock(&pid_lock);
+    for (usize i = 0; i < PID_LIMIT / 64; i++) {
+        u64 available = ~pid_bitmap[i];
+        if (available) {
+            int bit = __builtin_ctzll(available);
+            pid_bitmap[i] |= BIT(bit);
+            release_spinlock(&pid_lock);
+            return (int)(i * 64) + bit;
+        }
+    }
+    release_spinlock(&pid_lock);
+    PANIC();
+}
+
+static void free_pid(int pid)
+{
+    ASSERT(pid > 0 && pid < PID_LIMIT);
+    acquire_spinlock(&pid_lock);
+    ASSERT(pid_bitmap[pid / 64] & BIT(pid % 64));
+    pid_bitmap[pid / 64] &= ~BIT(pid % 64);
+    release_spinlock(&pid_lock);
+}
 
 // init_kproc initializes the kernel process
 // NOTE: should call after kinit
 void init_kproc()
 {
-    // TODO:
-    // 1. init global resources (e.g. locks, semaphores)
-    // 2. init the root_proc (finished)
+    init_spinlock(&tree_lock);
+    init_spinlock(&pid_lock);
+    memset(pid_bitmap, 0, sizeof(pid_bitmap));
+    pid_bitmap[0] = 1; // Reserve PID 0.
 
     init_proc(&root_proc);
     root_proc.parent = &root_proc;
@@ -26,9 +58,20 @@ void init_kproc()
 
 void init_proc(Proc *p)
 {
-    // TODO:
-    // setup the Proc with kstack and pid allocated
-    // NOTE: be careful of concurrency
+    ASSERT(p != NULL);
+    memset(p, 0, sizeof(*p));
+    p->pid = alloc_pid();
+    p->state = UNUSED;
+    init_sem(&p->childexit, 0);
+    init_list_node(&p->children);
+    init_list_node(&p->ptnode);
+    init_schinfo(&p->schinfo);
+    p->kstack = kalloc_page();
+    ASSERT(p->kstack != NULL);
+    p->ucontext = (UserContext *)((u8 *)p->kstack + PAGE_SIZE) - 1;
+    p->kcontext = (KernelContext *)p->ucontext - 1;
+    memset(p->ucontext, 0, sizeof(*p->ucontext));
+    memset(p->kcontext, 0, sizeof(*p->kcontext));
 }
 
 Proc *create_proc()
@@ -40,37 +83,94 @@ Proc *create_proc()
 
 void set_parent_to_this(Proc *proc)
 {
-    // TODO: set the parent of proc to thisproc
-    // NOTE: maybe you need to lock the process tree
-    // NOTE: it's ensured that the old proc->parent = NULL
+    Proc *parent = thisproc();
+    ASSERT(!parent->idle);
+    acquire_spinlock(&tree_lock);
+    ASSERT(proc->parent == NULL);
+    proc->parent = parent;
+    _insert_into_list(&parent->children, &proc->ptnode);
+    release_spinlock(&tree_lock);
 }
 
 int start_proc(Proc *p, void (*entry)(u64), u64 arg)
 {
-    // TODO:
-    // 1. set the parent to root_proc if NULL
-    // 2. setup the kcontext to make the proc start with proc_entry(entry, arg)
-    // 3. activate the proc and return its pid
-    // NOTE: be careful of concurrency
+    ASSERT(entry != NULL && p->state == UNUSED);
+    acquire_spinlock(&tree_lock);
+    if (p->parent == NULL) {
+        p->parent = &root_proc;
+        _insert_into_list(&root_proc.children, &p->ptnode);
+    }
+    p->kcontext->x0 = (u64)entry;
+    p->kcontext->x1 = arg;
+    p->kcontext->x30 = (u64)proc_entry;
+    int pid = p->pid;
+    release_spinlock(&tree_lock);
+    activate_proc(p);
+    // A different CPU may already have run and reaped p after activation.
+    return pid;
 }
 
 int wait(int *exitcode)
 {
-    // TODO:
-    // 1. return -1 if no children
-    // 2. wait for childexit
-    // 3. if any child exits, clean it up and return its pid and exitcode
-    // NOTE: be careful of concurrency
+    Proc *parent = thisproc();
+    ASSERT(!parent->idle);
+    for (;;) {
+        acquire_spinlock(&tree_lock);
+        bool empty = _empty_list(&parent->children);
+        release_spinlock(&tree_lock);
+        if (empty)
+            return -1;
+
+        // Never sleep while holding the tree lock. The semaphore remembers
+        // exits that occur between the check above and this wait.
+        if (!wait_sem(&parent->childexit))
+            continue;
+        acquire_spinlock(&tree_lock);
+        for (ListNode *node = parent->children.next;
+             node != &parent->children; node = node->next) {
+            Proc *child = container_of(node, Proc, ptnode);
+            // Taking sched_lock here also waits for exit's swtch to finish.
+            if (!is_zombie(child))
+                continue;
+            int pid = child->pid;
+            int code = child->exitcode;
+            _detach_from_list(&child->ptnode);
+            child->parent = NULL;
+            release_spinlock(&tree_lock);
+            if (exitcode)
+                *exitcode = code;
+            kfree_page(child->kstack);
+            kfree(child);
+            free_pid(pid);
+            return pid;
+        }
+        // Every successfully consumed notification must name a zombie child.
+        PANIC();
+    }
 }
 
 NO_RETURN void exit(int code)
 {
-    // TODO:
-    // 1. set the exitcode
-    // 2. clean up the resources
-    // 3. transfer children to the root_proc, and notify the root_proc if there is zombie
-    // 4. sched(ZOMBIE)
-    // NOTE: be careful of concurrency
+    Proc *p = thisproc();
+    ASSERT(p != &root_proc && !p->idle);
+    acquire_spinlock(&tree_lock);
+    p->exitcode = code;
+    while (!_empty_list(&p->children)) {
+        Proc *child = container_of(p->children.next, Proc, ptnode);
+        _detach_from_list(&child->ptnode);
+        child->parent = &root_proc;
+        _insert_into_list(&root_proc.children, &child->ptnode);
+        if (is_zombie(child))
+            post_sem(&root_proc.childexit);
+    }
+
+    // Notify before taking sched_lock: post_sem may acquire it itself.
+    // The parent cannot inspect the tree until we hold sched_lock, so its
+    // is_zombie() cannot finish until we have switched off this kernel stack.
+    post_sem(&p->parent->childexit);
+    acquire_sched_lock();
+    release_spinlock(&tree_lock);
+    sched(ZOMBIE);
 
     PANIC(); // prevent the warning of 'no_return function returns'
 }
