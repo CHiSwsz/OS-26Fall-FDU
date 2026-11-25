@@ -60,6 +60,7 @@ void init_proc(Proc *p)
 {
     ASSERT(p != NULL);
     memset(p, 0, sizeof(*p));
+    init_pgdir(&p->pgdir);
     p->pid = alloc_pid();
     p->state = UNUSED;
     init_sem(&p->childexit, 0);
@@ -153,6 +154,7 @@ NO_RETURN void exit(int code)
 {
     Proc *p = thisproc();
     ASSERT(p != &root_proc && !p->idle);
+    free_pgdir(&p->pgdir);
     acquire_spinlock(&tree_lock);
     p->exitcode = code;
     while (!_empty_list(&p->children)) {
@@ -177,7 +179,26 @@ NO_RETURN void exit(int code)
 
 int kill(int pid)
 {
-    // TODO:
-    // Set the killed flag of the proc to true and return 0.
-    // Return -1 if the pid is invalid (proc not found).
+    acquire_spinlock(&tree_lock);
+    Proc *p = &root_proc;
+    for (;;) {
+        if (p->pid == pid && !is_unused(p)) {
+            __atomic_store_n(&p->killed, true, __ATOMIC_RELEASE);
+            activate_proc(p);
+            release_spinlock(&tree_lock);
+            return 0;
+        }
+        // Depth-first traversal using parent links instead of kernel stack.
+        if (!_empty_list(&p->children)) {
+            p = container_of(p->children.next, Proc, ptnode);
+            continue;
+        }
+        while (p != &root_proc && p->ptnode.next == &p->parent->children)
+            p = p->parent;
+        if (p == &root_proc)
+            break;
+        p = container_of(p->ptnode.next, Proc, ptnode);
+    }
+    release_spinlock(&tree_lock);
+    return -1;
 }

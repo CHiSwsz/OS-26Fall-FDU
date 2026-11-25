@@ -42,7 +42,9 @@ void trap_global_handler(UserContext *context)
     }
     }
 
-    // TODO: stop killed process while returning to user space
+    if ((context->spsr_el1 & 0x1f) == 0 &&
+        __atomic_load_n(&thisproc()->killed, __ATOMIC_ACQUIRE))
+        exit(-1);
 }
 
 NO_RETURN void trap_error_handler(u64 type)
