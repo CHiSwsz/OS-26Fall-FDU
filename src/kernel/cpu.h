@@ -6,7 +6,8 @@
 #define NCPU 4
 
 struct sched {
-    // TODO: customize your sched info
+    Proc *current;
+    Proc idle;
 };
 
 struct cpu {
