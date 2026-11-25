@@ -85,6 +85,7 @@ bool activate_proc(Proc *p)
     acquire_sched_lock();
     bool activated = false;
     switch (p->state) {
+    case ZOMBIE:
     case RUNNING:
     case RUNNABLE:
         break;
@@ -135,6 +136,10 @@ void sched(enum procstate new_state)
 {
     auto this = thisproc();
     ASSERT(this->state == RUNNING);
+    if (__atomic_load_n(&this->killed, __ATOMIC_ACQUIRE) && new_state != ZOMBIE) {
+        release_sched_lock();
+        return;
+    }
     update_this_state(new_state);
     auto next = pick_next();
     update_this_proc(next);

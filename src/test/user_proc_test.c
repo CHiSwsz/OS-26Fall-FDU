@@ -72,10 +72,10 @@ void user_proc_test()
         }
         ASSERT(p->pgdir.pt);
 
-        // TODO: setup the user context
-        // 1. set x0 = i
-        // 2. set elr = EXTMEM
-        // 3. set spsr = 0
+        p->ucontext->x[0] = i;
+        p->ucontext->elr_el1 = EXTMEM;
+        p->ucontext->spsr_el1 = 0; // EL0t, IRQ unmasked
+        p->ucontext->sp_el0 = 0;   // loop.S does not use a stack
 
         pids[i] = start_proc(p, trap_return, 0);
         printk("pid[%d] = %d\n", i, pids[i]);

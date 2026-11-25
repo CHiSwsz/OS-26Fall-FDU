@@ -3,13 +3,39 @@
 #include <common/string.h>
 #include <aarch64/intrinsic.h>
 
+static PTEntriesPtr new_table(void)
+{
+    PTEntriesPtr table = kalloc_page();
+    if (table)
+        memset(table, 0, PAGE_SIZE);
+    return table;
+}
+
 PTEntriesPtr get_pte(struct pgdir *pgdir, u64 va, bool alloc)
 {
-    // TODO:
-    // Return a pointer to the PTE (Page Table Entry) for virtual address 'va'
-    // If the entry not exists (NEEDN'T BE VALID), allocate it if alloc=true, or return NULL if false.
-    // THIS ROUTINUE GETS THE PTE, NOT THE PAGE DESCRIBED BY PTE.
-    // Return Kernel Address.
+    if (va >> 48)
+        return NULL;
+    if (!pgdir->pt && alloc)
+        pgdir->pt = new_table();
+    PTEntriesPtr table = pgdir->pt;
+    if (!table)
+        return NULL;
+    u64 index[] = { VA_PART0(va), VA_PART1(va), VA_PART2(va) };
+    for (unsigned level = 0; level < 3; level++) {
+        PTEntry *entry = &table[index[level]];
+        if (!(*entry & PTE_VALID)) {
+            if (!alloc)
+                return NULL;
+            PTEntriesPtr child = new_table();
+            if (!child)
+                return NULL;
+            *entry = K2P(child) | PTE_TABLE;
+        }
+        if ((*entry & 3) != PTE_TABLE)
+            return NULL;
+        table = (PTEntriesPtr)P2K(PTE_ADDRESS(*entry));
+    }
+    return &table[VA_PART3(va)];
 }
 
 void init_pgdir(struct pgdir *pgdir)
@@ -17,11 +43,25 @@ void init_pgdir(struct pgdir *pgdir)
     pgdir->pt = NULL;
 }
 
+static void free_table(PTEntriesPtr table, unsigned level)
+{
+    if (level < 3) {
+        for (unsigned i = 0; i < N_PTE_PER_TABLE; i++)
+            if ((table[i] & 3) == PTE_TABLE)
+                free_table((PTEntriesPtr)P2K(PTE_ADDRESS(table[i])), level + 1);
+    }
+    kfree_page(table);
+}
+
 void free_pgdir(struct pgdir *pgdir)
 {
-    // TODO:
-    // Free pages used by the page table. If pgdir->pt=NULL, do nothing.
-    // DONT FREE PAGES DESCRIBED BY THE PAGE TABLE
+    PTEntriesPtr root = pgdir->pt;
+    if (!root)
+        return;
+    pgdir->pt = NULL;
+    if (arch_get_ttbr0() == K2P(root))
+        attach_pgdir(pgdir);
+    free_table(root, 0);
 }
 
 void attach_pgdir(struct pgdir *pgdir)
